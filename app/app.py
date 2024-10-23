@@ -23,7 +23,7 @@ uploaded_file = st.file_uploader("Upload your Word document", type="docx")
 user_query = st.text_area(
     'Enter your query for translation (multiline supported):',
     value='',  # Initial text (empty in this case)
-    height=150  # Height of the text area in pixels
+    height=150  # Height of the text area in pixels df
 )
 
 # Optional: Language selection
