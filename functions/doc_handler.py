@@ -1,142 +1,187 @@
 from docx import Document
 from datetime import datetime
-from typing import List, Tuple, Dict, Optional
 import os
+from typing import Dict, List, Optional, Any, Union
+from dataclasses import dataclass, field
 
-class DocumentHandler:
+@dataclass
+class ContentNode:
+    """Represents a node in the document structure"""
+    content: str
+    priority: Optional[int] = None
+    children: Dict[str, 'ContentNode'] = field(default_factory=dict)
+    style_name: str = ''  # Store the original style name for reconstruction
+
+class DocxProcessor:
     def __init__(self, file_path: str):
-        """Initialize the DocumentHandler with a Word document.
-        
-        Args:
-            file_path (str): Path to the Word document
-        """
         self.file_path = file_path
         self.document = Document(file_path)
+        # Map priority levels to style names for reconstruction
+        self.style_priority_map = self._build_style_priority_map()
         
-    def get_paragraph_text_and_header(self, paragraph_index: int) -> Tuple[str, Optional[int]]:
-        """Get the text and header level of a specific paragraph.
+    def _build_style_priority_map(self) -> Dict[int, str]:
+        """Build a mapping of priority levels to style names"""
+        style_map = {}
+        for style in self.document.styles:
+            if hasattr(style, 'priority') and style.priority is not None:
+                style_map[style.priority] = style.name
+        return style_map
+
+    def _get_style_by_priority(self, priority: int) -> Optional[str]:
+        """Get style name for a given priority level"""
+        return self.style_priority_map.get(priority)
+
+    def get_structure(self) -> ContentNode:
+        """Extract document structure into a ContentNode tree"""
+        root = ContentNode(content="ROOT", priority=float('inf'))
+        current_path = []  # Stack to track current position in hierarchy
         
-        Args:
-            paragraph_index (int): Index of the paragraph
+        for para in self.document.paragraphs:
+            priority = para.style.priority if hasattr(para.style, 'priority') else None
             
-        Returns:
-            Tuple[str, Optional[int]]: Tuple of (text, header_level). 
-                                     Header level is None if paragraph is not a header
-        """
-        if paragraph_index >= len(self.document.paragraphs):
-            raise IndexError("Paragraph index out of range")
-            
-        paragraph = self.document.paragraphs[paragraph_index]
-        
-        # Check if paragraph is a header by checking its style
-        header_level = None
-        if paragraph.style.name.startswith('Heading'):
-            header_level = int(paragraph.style.name[-1])
-            
-        return paragraph.text, header_level
-    
-    def get_document_structure(self) -> Dict[str, List[Dict]]:
-        """Analyze document structure and return hierarchy of headers.
-        
-        Returns:
-            Dict[str, List[Dict]]: Dictionary containing document structure
-        """
-        structure = {
-            'headers': [],
-            'total_paragraphs': len(self.document.paragraphs)
-        }
-        
-        for i, paragraph in enumerate(self.document.paragraphs):
-            if paragraph.style.name.startswith('Heading'):
-                level = int(paragraph.style.name[-1])
-                structure['headers'].append({
-                    'level': level,
-                    'text': paragraph.text,
-                    'index': i
-                })
+            if priority is not None:
+                # Pop from current_path until we find a higher priority
+                while current_path and current_path[-1].priority <= priority:
+                    current_path.pop()
                 
-        return structure
-    
-    def update_section(self, section_index: int, new_text: str, is_header: bool = False) -> None:
-        """Update the text of a specific section.
-        
-        Args:
-            section_index (int): Index of the section to update
-            new_text (str): New text for the section
-            is_header (bool): Whether the section is a header (preserves header formatting)
+                # Create new node
+                new_node = ContentNode(
+                    content=para.text,
+                    priority=priority,
+                    style_name=para.style.name
+                )
+                
+                # Add to hierarchy
+                parent = current_path[-1] if current_path else root
+                parent.children[para.text] = new_node
+                current_path.append(new_node)
+            else:
+                # Regular text - add to most recent section
+                if current_path:
+                    current_node = current_path[-1]
+                    # Use text as key with timestamp to handle multiple paragraphs
+                    key = f"{para.text[:30]}_{datetime.now().timestamp()}"
+                    current_node.children[key] = ContentNode(
+                        content=para.text,
+                        priority=None,
+                        style_name='Normal'
+                    )
+
+        return root
+
+    def update_content(self, section_key: str, new_content: Union[str, Dict[str, Any]], root: Optional[ContentNode] = None) -> bool:
         """
-        if section_index >= len(self.document.paragraphs):
-            raise IndexError("Section index out of range")
-            
-        paragraph = self.document.paragraphs[section_index]
+        Update specific sections of the document while preserving others.
+        Returns True if update was successful.
         
-        # If it's a header, preserve the header style
-        style_name = paragraph.style.name
-        
-        # Clear the paragraph and add new text
-        paragraph.clear()
-        run = paragraph.add_run(new_text)
-        
-        # Restore style if it's a header
-        if is_header:
-            paragraph.style = style_name
-            
-    def save_document(self, output_dir: str = None) -> str:
-        """Save the document with date appended to filename.
-        
-        Args:
-            output_dir (str, optional): Directory to save the file. Defaults to same directory.
-            
-        Returns:
-            str: Path of the saved document
+        Parameters:
+            section_key: Key of section to update
+            new_content: New content (either string for simple update or dict for structural update)
+            root: Root node (optional, used for recursion)
         """
-        # Get original filename without extension
+        if root is None:
+            root = self.get_structure()
+
+        def update_node_recursive(node: ContentNode, content_dict: Dict[str, Any]) -> ContentNode:
+            """Recursively update node with new content structure"""
+            updated_node = ContentNode(
+                content=content_dict.get('content', node.content),
+                priority=content_dict.get('priority', node.priority),
+                style_name=content_dict.get('style_name', node.style_name)
+            )
+            
+            # Update children if provided
+            if 'children' in content_dict:
+                for child_key, child_content in content_dict['children'].items():
+                    if isinstance(child_content, dict):
+                        updated_node.children[child_key] = update_node_recursive(
+                            ContentNode("", None), child_content
+                        )
+                    else:
+                        updated_node.children[child_key] = ContentNode(
+                            content=child_content,
+                            priority=None,
+                            style_name='Normal'
+                        )
+            
+            return updated_node
+
+        def find_and_update(current_node: ContentNode, target_key: str, new_data: Union[str, Dict[str, Any]]) -> bool:
+            if target_key in current_node.children:
+                if isinstance(new_data, str):
+                    current_node.children[target_key].content = new_data
+                else:
+                    current_node.children[target_key] = update_node_recursive(
+                        current_node.children[target_key], new_data
+                    )
+                return True
+                
+            for child in current_node.children.values():
+                if find_and_update(child, target_key, new_data):
+                    return True
+            return False
+
+        return find_and_update(root, section_key, new_content)
+
+    def _rebuild_document(self, root: ContentNode) -> None:
+        """Rebuild document from ContentNode structure"""
+        self.document = Document()
+        
+        def add_node_to_document(node: ContentNode) -> None:
+            if node.content != "ROOT":
+                paragraph = self.document.add_paragraph(node.content)
+                if node.priority is not None:
+                    paragraph.style = node.style_name
+                
+            # Add all children in order of priority
+            sorted_children = sorted(
+                node.children.values(),
+                key=lambda x: (x.priority or -1, x.content),
+                reverse=True
+            )
+            
+            for child in sorted_children:
+                add_node_to_document(child)
+                
+        add_node_to_document(root)
+
+    def save_document(self, root: Optional[ContentNode] = None) -> str:
+        """Save document with date in filename"""
+        if root:
+            self._rebuild_document(root)
+            
+        file_dir = os.path.dirname(self.file_path)
         base_name = os.path.splitext(os.path.basename(self.file_path))[0]
-        
-        # Create new filename with date
-        date_str = datetime.now().strftime("%Y%m%d")
+        date_str = datetime.now().strftime('%Y%m%d')
         new_filename = f"{base_name}_{date_str}.docx"
+        new_path = os.path.join(file_dir, new_filename)
         
-        # Determine save path
-        if output_dir:
-            os.makedirs(output_dir, exist_ok=True)
-            save_path = os.path.join(output_dir, new_filename)
-        else:
-            save_path = os.path.join(os.path.dirname(self.file_path), new_filename)
-            
-        self.document.save(save_path)
-        return save_path
+        self.document.save(new_path)
+        return new_path
+
+# Example usage:
+if __name__ == "__main__":
+    processor = DocxProcessor("example.docx")
     
-    def get_full_text(self) -> str:
-        
-        """Get all text content from the document.
-        
-        Returns:
-            str: Full text content of the document
-        """
-        return "\n".join([paragraph.text for paragraph in self.document.paragraphs if paragraph.text])
+    # Get current structure
+    doc_structure = processor.get_structure()
     
-    def get_section_by_header(self, header_text: str) -> Tuple[int, str]:
-        """Find a section by its header text and return its index and content.
-        
-        Args:
-            header_text (str): Text of the header to search for
-            
-        Returns:
-            Tuple[int, str]: Tuple of (section_index, section_text)
-            
-        Raises:
-            ValueError: If header is not found
-        """
-        for i, paragraph in enumerate(self.document.paragraphs):
-            if paragraph.style.name.startswith('Heading') and header_text.lower() in paragraph.text.lower():
-                # Find the content until the next header or document end
-                content = []
-                current_idx = i + 1
-                while (current_idx < len(self.document.paragraphs) and 
-                       not self.document.paragraphs[current_idx].style.name.startswith('Heading')):
-                    content.append(self.document.paragraphs[current_idx].text)
-                    current_idx += 1
-                return i, "\n".join(content)
-                
-        raise ValueError(f"Header '{header_text}' not found in document")
+    # Example of updating a specific section
+    new_section_content = {
+        "content": "Updated Section Title",
+        "priority": 9,
+        "style_name": "Heading 1",
+        "children": {
+            "subsection1": {
+                "content": "New Subsection",
+                "priority": 8,
+                "style_name": "Heading 2",
+                "children": {
+                    "text1": "New content paragraph"
+                }
+            }
+        }
+    }
+    
+    processor.update_content("Original Section Title", new_section_content, doc_structure)
+    processor.save_document(doc_structure)
